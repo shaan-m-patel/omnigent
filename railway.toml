@@ -5,7 +5,7 @@
 
 [build]
 builder = "DOCKERFILE"
-dockerfilePath = "omnigent/Dockerfile.prebuilt"
+dockerfilePath = "deploy/docker/Dockerfile.prebuilt"
 
 [deploy]
 healthcheckPath = "/health"
