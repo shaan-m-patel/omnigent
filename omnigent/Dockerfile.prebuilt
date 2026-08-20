@@ -11,11 +11,11 @@
 # fork. Pair with the Railway Postgres plugin (DATABASE_URL auto-injected).
 #
 # Required Railway Variables for this agent to run:
-#   ANTHROPIC_API_KEY  - model provider key (claude-sdk harness resolves the
-#                        default Claude model from this; no Databricks needed)
+#   OPENAI_API_KEY     - already set; powers the openai-agents harness (model gpt-4o)
 #   MEM0_API_KEY       - already set (Mem0 Cloud memory layer)
-#   GITHUB_TOKEN       - read-only GitHub access (see tools/mcp/github.yaml;
-#                        verify auth method with a live test before relying on it)
+#   GITHUB_TOKEN       - your "PersonalAgent" PAT (read scopes: Contents/Issues/PRs);
+#                        GitHub's remote MCP accepts a PAT Bearer header (confirmed).
+#                        Add to Railway Variables when ready; GitHub MCP tools come online then.
 #
 # Optional (V2): mount a Railway Volume at /data/artifacts for persistent
 # artifact storage across redeploys.
@@ -23,8 +23,9 @@
 ARG OMNIGENT_IMAGE=ghcr.io/omnigent-ai/omnigent-server:latest
 FROM ${OMNIGENT_IMAGE}
 
-# Layer in the custom agent + MCP server configs.
-COPY agents/shaan-assistant /opt/omnigent/agents/shaan-assistant
+# Layer in the custom agent + MCP server configs. Build context is the repo root,
+# so the COPY source is omnigent/agents/shaan-assistant (not agents/shaan-assistant).
+COPY omnigent/agents/shaan-assistant /opt/omnigent/agents/shaan-assistant
 
 # Tell the server where global config + agents live.
 ENV OMNIGENT_CONFIG_HOME=/opt/omnigent
