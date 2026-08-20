@@ -1,0 +1,21 @@
+# GitHub MCP (hosted remote, read-only). Auto-discovered from tools/mcp/.
+#
+# Confirmed: the remote GitHub MCP server at https://api.githubcopilot.com/mcp/
+# accepts a Personal Access Token via the Authorization: Bearer header, and the
+# PAT takes precedence over OAuth (GitHub docs). Since Omnigent is a third-party
+# MCP client (no Dynamic Client Registration), the PAT Bearer path is the
+# supported one — no OAuth device flow needed.
+#
+# The GITHUB_TOKEN (your fine-grained PAT named "PersonalAgent") must carry read
+# scopes for the toolsets used: Contents: Read (repos), Issues: Read, Pull
+# requests: Read. Set GITHUB_TOKEN in Railway Variables (secure entry).
+name: github
+description: >-
+  Read-only GitHub access — repos, issues, pull requests for shaan-m-patel.
+  V1: search/read only. No writes, pushes, or merges.
+transport: http
+url: https://api.githubcopilot.com/mcp/
+headers:
+  Authorization: Bearer ${GITHUB_TOKEN}
+  X-MCP-Readonly: "true"
+  X-MCP-Toolsets: repos,issues,pull_requests

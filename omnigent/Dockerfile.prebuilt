@@ -1,0 +1,30 @@
+# Railway build for the personal-agent-os fork.
+#
+# This extends the official prebuilt server image (which already contains the
+# web UI bundle that a source build can't produce) and layers in Shaan's
+# custom agent + MCP server configs. The server auto-discovers the agent from
+# /opt/omnigent/agents/shaan-assistant/config.yaml and its MCP servers from
+# tools/mcp/ (omnigent/spec/parser.py:_discover_mcp_servers).
+#
+# Deploy: Railway reads railway.toml (builder=DOCKERFILE,
+# dockerfilePath=omnigent/Dockerfile.prebuilt) from the shaan-m-patel/omnigent
+# fork. Pair with the Railway Postgres plugin (DATABASE_URL auto-injected).
+#
+# Required Railway Variables for this agent to run:
+#   ANTHROPIC_API_KEY  - model provider key (claude-sdk harness resolves the
+#                        default Claude model from this; no Databricks needed)
+#   MEM0_API_KEY       - already set (Mem0 Cloud memory layer)
+#   GITHUB_TOKEN       - read-only GitHub access (see tools/mcp/github.yaml;
+#                        verify auth method with a live test before relying on it)
+#
+# Optional (V2): mount a Railway Volume at /data/artifacts for persistent
+# artifact storage across redeploys.
+
+ARG OMNIGENT_IMAGE=ghcr.io/omnigent-ai/omnigent-server:latest
+FROM ${OMNIGENT_IMAGE}
+
+# Layer in the custom agent + MCP server configs.
+COPY agents/shaan-assistant /opt/omnigent/agents/shaan-assistant
+
+# Tell the server where global config + agents live.
+ENV OMNIGENT_CONFIG_HOME=/opt/omnigent
