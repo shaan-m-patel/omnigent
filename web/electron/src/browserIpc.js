@@ -284,14 +284,22 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
   // Open (create-if-absent) or navigate a conversation's view, and measure it
   // into place. `force` reloads even on the same URL (agent "bring me back"
   // intent). Returns the registry's structured `{ ok, created, error }`.
-  ipcMain.handle("omnigent:browser-open-or-navigate", (event, args) => {
+  ipcMain.handle("omnigent:browser-open-or-navigate", async (event, args) => {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
     const { conversationId, url, bounds, opts } = args ?? {};
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
-    const r = g.registry.openOrNavigate(conversationId, url, bounds, opts);
+    let r;
+    try {
+      r = await g.registry.openOrNavigate(conversationId, url, bounds, opts);
+    } catch (e) {
+      return {
+        ok: false,
+        error: `navigation blocked: ${e && e.message ? e.message : e}`,
+      };
+    }
     // On first creation, wire nav listeners here (not in the registry factory,
     // which stays Electron-free) so the URL bar can live-track the real url.
     if (r.ok && r.created && r.entry) {
