@@ -17,9 +17,23 @@
  *    detached on hide and destroyed only on explicit close.
  */
 
-const { isAgentNavigationAllowed } = require("./browserUrlPolicy");
+const dns = require("node:dns");
+
+const { isAgentNavigationAllowed, resolveAgentNavigation } = require("./browserUrlPolicy");
+const { createAgentConnectProxy } = require("./browserConnectProxy");
 
 const DEFAULT_CAP = 10;
+
+function defaultLookup(hostname) {
+  return dns.promises.lookup(hostname, { all: true, verbatim: true });
+}
+
+// Electron partition strings are path-like. Keep the conversation id readable
+// but drop anything that isn't a token character.
+function browserPartition(conversationId) {
+  const safe = String(conversationId).replace(/[^A-Za-z0-9_-]/g, "_");
+  return `persist:omnigent-browser-${safe}`;
+}
 
 function createBrowserViewRegistry({
   WebContentsViewCtor, // (opts) => new WebContentsView(opts) — injectable for tests
@@ -30,9 +44,21 @@ function createBrowserViewRegistry({
   getHostZoomFactor = () => 1,
   getHostDisplayScaleFactor = () => null,
   cap = DEFAULT_CAP,
+  // Hostname → addresses. Tests inject this; production uses the OS resolver.
+  lookup = defaultLookup,
+  // Builds the local pinning proxy. Tests inject a fake connect path.
+  createConnectProxy = createAgentConnectProxy,
+  // When set, skips the real session proxy (unit tests have no Electron session).
+  pinAgentConnection = null,
+  clearAgentConnection = null,
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
   let activeConversationId = null;
+  // One pinning proxy per registry (per window). Started on the first agent
+  // navigation and stopped when the last view closes. `unref`'d so a forgotten
+  // close does not keep the process alive.
+  let connectProxy = null;
+  let connectProxyStart = null;
   // When true, the active view is hidden in place (setVisible(false)) so DOM
   // overlays (dialogs, menus, tooltips, toasts) aren't covered by the native
   // layer, which always paints above the renderer regardless of z-index. Sticky
@@ -86,6 +112,10 @@ function createBrowserViewRegistry({
       // this, the allowlist only guards the first hop and a redirect to an
       // internal host slips through (SSRF via screenshot).
       agentNavLocked: false,
+      // True only after the view's session is pointed at the pinning proxy.
+      // The nav guard treats a locked-but-unpinned view as deny-all.
+      agentProxyEngaged: false,
+      proxyLoginListener: null,
       // Design-mode listeners + webContents, set by browserIpc's enable handler
       // and cleared on disable/close (console-message forwarder + native-gesture
       // tracker). Null until design mode is enabled for this entry.
@@ -111,6 +141,8 @@ function createBrowserViewRegistry({
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
+        // Own session so the pinning proxy never becomes the shell window's proxy.
+        partition: browserPartition(conversationId),
       },
     });
     const entry = makeEntry(conversationId, view);
@@ -141,23 +173,36 @@ function createBrowserViewRegistry({
   // `entry.agentNavLocked` (set per-navigation from opts.agent), so user-typed
   // URL-bar browsing — including legitimate auth-redirect chains to internal
   // hosts — stays permissive.
+  function blockAgentNav(event, conversationId, targetUrl, error) {
+    try {
+      event.preventDefault();
+    } catch {
+      /* event shape without preventDefault — nothing to cancel */
+    }
+    sendToRenderer("browser-nav-blocked", { conversationId, url: targetUrl, error });
+  }
+
   function attachAgentNavGuard(conversationId, entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
     const guard = (event, targetUrl) => {
       if (!entry.agentNavLocked) return; // user-driven nav: permissive
+      // Fail closed until the pinning proxy is installed. A redirect that
+      // lands in that window must not dial with Chromium's own resolver.
+      if (!entry.agentProxyEngaged) {
+        blockAgentNav(
+          event,
+          conversationId,
+          targetUrl,
+          "navigation blocked: agent browser connection is not pinned",
+        );
+        return;
+      }
+      // Literals and schemes are rejected here. Hostnames pass the string
+      // check and are resolved once by the pinning proxy on the way out.
       const verdict = isAgentNavigationAllowed(targetUrl);
       if (!verdict.ok) {
-        try {
-          event.preventDefault();
-        } catch {
-          /* event shape without preventDefault — nothing to cancel */
-        }
-        sendToRenderer("browser-nav-blocked", {
-          conversationId,
-          url: targetUrl,
-          error: verdict.error,
-        });
+        blockAgentNav(event, conversationId, targetUrl, verdict.error);
       }
     };
     wc.on("will-navigate", guard);
@@ -170,26 +215,174 @@ function createBrowserViewRegistry({
     });
   }
 
-  function openOrNavigate(conversationId, url, bounds, opts) {
+  function restoreAgentLock(entry, prevLocked, prevEngaged) {
+    if (!entry) return;
+    entry.agentNavLocked = prevLocked;
+    entry.agentProxyEngaged = prevEngaged;
+  }
+
+  async function sharedProxy() {
+    if (connectProxy) return connectProxy;
+    if (!connectProxyStart) {
+      connectProxyStart = (async () => {
+        const proxy = createConnectProxy({ lookup });
+        await proxy.listen();
+        connectProxy = proxy;
+        return proxy;
+      })().catch((err) => {
+        connectProxyStart = null;
+        throw err;
+      });
+    }
+    return connectProxyStart;
+  }
+
+  function stopSharedProxy() {
+    if (entries.size !== 0) return;
+    const proxy = connectProxy;
+    connectProxy = null;
+    connectProxyStart = null;
+    if (proxy) proxy.close();
+  }
+
+  function attachProxyLogin(entry, proxy) {
+    if (entry.proxyLoginListener) return;
+    const wc = entry.view && entry.view.webContents;
+    if (!wc || typeof wc.on !== "function") return;
+    const onLogin = (event, _details, authInfo, callback) => {
+      if (!authInfo || !authInfo.isProxy || typeof callback !== "function") return;
+      try {
+        event.preventDefault();
+      } catch {
+        /* no preventDefault */
+      }
+      callback(proxy.username, proxy.password);
+    };
+    wc.on("login", onLogin);
+    entry.proxyLoginListener = onLogin;
+  }
+
+  function detachProxyLogin(entry) {
+    const wc = entry && entry.view && entry.view.webContents;
+    if (!entry || !entry.proxyLoginListener || !wc || typeof wc.removeListener !== "function") {
+      if (entry) entry.proxyLoginListener = null;
+      return;
+    }
+    try {
+      wc.removeListener("login", entry.proxyLoginListener);
+    } catch {
+      /* destroyed */
+    }
+    entry.proxyLoginListener = null;
+  }
+
+  // Point the view's own session at the pinning proxy. Chromium then sends
+  // every request (navigation, redirect, subframe) here, and the proxy dials
+  // only the address it just resolved. Missing session fails closed.
+  async function defaultPinAgentConnection(entry) {
+    const wc = entry.view && entry.view.webContents;
+    const session = wc && wc.session;
+    if (!wc || !session || typeof session.setProxy !== "function" || typeof wc.on !== "function") {
+      return {
+        ok: false,
+        error: "navigation blocked: agent browser cannot pin the resolved address",
+      };
+    }
+    let proxy;
+    try {
+      proxy = await sharedProxy();
+    } catch {
+      return {
+        ok: false,
+        error: "navigation blocked: agent browser connect proxy failed to start",
+      };
+    }
+    attachProxyLogin(entry, proxy);
+    try {
+      await session.setProxy({
+        mode: "fixed_servers",
+        proxyRules: `http://127.0.0.1:${proxy.port()}`,
+        proxyBypassRules: "",
+      });
+    } catch {
+      return { ok: false, error: "navigation blocked: failed to pin agent browser connections" };
+    }
+    return { ok: true };
+  }
+
+  async function defaultClearAgentConnection(entry) {
+    const session = entry.view && entry.view.webContents && entry.view.webContents.session;
+    if (!session || typeof session.setProxy !== "function") return;
+    await session.setProxy({ mode: "direct" });
+  }
+
+  async function openOrNavigate(conversationId, url, bounds, opts) {
     const force = !!(opts && opts.force);
-    // Agent-driven nav (opts.agent) is gated by an allowlist (see
-    // browserUrlPolicy) so the model can't point the view at file:// /
-    // metadata / loopback / private hosts and exfiltrate via screenshot. URL-bar
-    // (user-typed) nav stays permissive. Checked before getOrCreate so a
-    // rejected nav creates no blank view.
-    if (opts && opts.agent && url) {
-      const verdict = isAgentNavigationAllowed(url);
+    const agent = !!(opts && opts.agent);
+    // Agent-driven nav is gated by the literal allowlist AND a DNS pin, so the
+    // model can't point the view at file:// / metadata / private / rebinding
+    // hosts and exfiltrate via screenshot. URL-bar nav stays permissive.
+    // Checked before getOrCreate so a rejected nav creates no blank view.
+    // An existing view is fail-closed for the duration of the lookup so a
+    // redirect cannot race the check.
+    const existing = agent && url ? entries.get(conversationId) : null;
+    const prevLocked = existing ? existing.agentNavLocked : false;
+    const prevEngaged = existing ? existing.agentProxyEngaged : false;
+    if (existing) {
+      existing.agentNavLocked = true;
+      existing.agentProxyEngaged = false;
+    }
+    if (agent && url) {
+      let verdict;
+      try {
+        verdict = await resolveAgentNavigation(url, lookup);
+      } catch {
+        restoreAgentLock(existing, prevLocked, prevEngaged);
+        return { ok: false, error: "navigation blocked: destination check failed" };
+      }
       if (!verdict.ok) {
+        restoreAgentLock(existing, prevLocked, prevEngaged);
         return { ok: false, error: verdict.error };
       }
     }
     const result = getOrCreate(conversationId);
-    if (!result.ok) return result;
+    if (!result.ok) {
+      restoreAgentLock(existing, prevLocked, prevEngaged);
+      return result;
+    }
     const { entry, created } = result;
     // Latch who drives THIS navigation so the will-navigate/will-redirect guard
     // enforces the allowlist on an agent nav's whole redirect chain, and leaves
-    // user-typed URL-bar nav permissive. Set only when a url is actually issued.
-    if (url) entry.agentNavLocked = !!(opts && opts.agent);
+    // user-typed URL-bar nav permissive. The proxy must be engaged before
+    // loadURL; until then the guard rejects every hop.
+    if (url && agent) {
+      entry.agentNavLocked = true;
+      entry.agentProxyEngaged = false;
+      const pin = await (pinAgentConnection || defaultPinAgentConnection)(entry);
+      if (!pin.ok) {
+        detachProxyLogin(entry);
+        if (created) close(conversationId, "agent-pin-failed");
+        else restoreAgentLock(entry, prevLocked, prevEngaged);
+        return {
+          ok: false,
+          error: pin.error || "navigation blocked: failed to pin agent browser connections",
+        };
+      }
+      entry.agentProxyEngaged = true;
+    } else if (url) {
+      try {
+        await (clearAgentConnection || defaultClearAgentConnection)(entry);
+      } catch {
+        // Stay agent-locked if the session is still pointed at the pinning proxy.
+        return {
+          ok: false,
+          error: "navigation failed: could not disable the agent connection pin",
+        };
+      }
+      detachProxyLogin(entry);
+      entry.agentNavLocked = false;
+      entry.agentProxyEngaged = false;
+    }
     if (bounds) entry.boundsController.setRendererBounds(bounds);
     // Only attach immediately when this is the active conversation; otherwise
     // create-detached and let `setActive(conversationId)` attach on user switch.
@@ -320,6 +513,7 @@ function createBrowserViewRegistry({
       entry.designModeInputListener = null;
       entry.designModeWebContents = null;
     }
+    detachProxyLogin(entry);
     entry.boundsController.clear();
     try {
       entry.view.webContents.close();
@@ -327,6 +521,7 @@ function createBrowserViewRegistry({
       /* already destroyed */
     }
     entries.delete(conversationId);
+    stopSharedProxy();
     sendToRenderer("browser-view-closed", { conversationId, reason: reason || null });
     return { ok: true, removed: true };
   }
